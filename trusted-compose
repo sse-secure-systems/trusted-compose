@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+
+# needs: wheel, pyyaml, dockerfile-parse
+
+import operator
+import os
+import queue
+import subprocess
+import sys
+import yaml
+
+from functools import reduce
+from threading import Thread
+
+from dockerfile_parse import DockerfileParser
+
+LOCAL_REGISTRY='localhost:5000'
+
+arguments = sys.argv[1:]
+
+actions = ['build', 'bundle', 'config', 'create', 'down', 'events', 'exec', 'help', 'images', 'kill',
+           'logs', 'pause', 'port', 'ps', 'pull', 'push', 'restart', 'rm', 'run', 'scale', 'start',
+           'stop', 'top', 'unpause', 'up', 'version']
+
+
+class EnvironmentContextManager:
+    def __init__(self, variable, value):
+        self.variable = variable
+        self.value = value
+
+    def __enter__(self):
+        self.old_value = os.environ.pop(self.variable, None)
+        os.environ[self.variable] = self.value
+
+    def __exit__(self, type, value, traceback):
+        if self.old_value is None:
+            os.environ.pop(self.variable)
+        else:
+            os.environ[self.variable] = self.old_value
+
+
+class DockerContentTrust(EnvironmentContextManager):
+    def __init__(self):
+        super().__init__('DOCKER_CONTENT_TRUST', '1')
+
+
+class DockerRegistry(EnvironmentContextManager):
+    def __init__(self, value=''):
+        if value:
+           value += '/'
+        super().__init__('DOCKER_REGISTRY', value)
+
+
+class Trust(DockerRegistry):
+    hook = None
+
+    def __init__(self, arguments, hooks):
+        self.compose_arguments = arguments
+        self.command_arguments = []
+        self.action = self._pop_action(arguments)
+        self.hooks = hooks
+
+        # Ensure there is no command ambiguity
+        action = self._pop_action(arguments)
+        if action is not None:
+            raise RuntimeError('Multiple reserved words encountered: {}, {}'.format(self.action, action))
+
+        super().__init__(LOCAL_REGISTRY)
+
+    def _pop_action(self, arguments):
+        for index, argument in enumerate(arguments):
+            if argument in actions:
+                arguments.pop(index)
+                self.compose_arguments = arguments[:index] + [argument]
+                self.command_arguments = arguments[index:]
+                return argument
+        return None
+
+    def _get_hook(self, trigger):
+        candidate = self.hooks.get(self.action)
+        try:
+            return candidate[trigger]
+        except (KeyError, TypeError):
+            return None
+
+    def __enter__(self):
+        super().__enter__()  # Set up environment
+
+        hook = self.hooks.get(self.action)
+        if callable(hook):
+            self.hook = hook
+            self.trusted_arguments = self.command_arguments
+        else:
+            arguments = self.compose_arguments
+
+            hook = self._get_hook('pre')
+            if hook:
+                arguments += hook(self.command_arguments)
+            self.trusted_arguments = arguments + self.command_arguments
+
+        return self
+
+    def __exit__(self, type, value, traceback):
+        hook = self._get_hook('post')
+        if hook:
+            hook()
+
+        super().__exit__(type, value, traceback)
+
+
+def get_docker_compose_service_items(keyList):
+    with open('docker-compose.yml', 'r') as stream:
+        yml = yaml.safe_load(stream)
+    return [reduce(operator.getitem, keyList, value) for value in yml['services'].values()]
+
+
+def run_docker(*args, quiet=False, raise_exception=True):
+    cmd = ['docker'] + list(args)
+    print('>>> {}'.format(' '.join(cmd)))
+    stdout=open(os.devnull, 'w') if quiet else None
+    process = subprocess.Popen(cmd, stdout=stdout)
+    returncode = process.wait()
+    if returncode and raise_exception:
+        raise RuntimeError(returncode)
+    return returncode == 0
+
+
+def expand_image_references(images):
+    images = {image: {} for image in images}
+    with DockerRegistry():
+        for image in images:
+            images[image]['remote'] = os.path.expandvars(image)
+    with DockerRegistry(LOCAL_REGISTRY):
+        for image in images:
+            images[image]['local'] = os.path.expandvars(image)
+    return images
+
+
+def safely_populate_local_from_remote(images):
+    # Pull, verify, tag, push
+    with DockerContentTrust():
+        for image in images.values():
+            print('Pulling and verifying parent image {} ...'.format(image['remote']))
+            run_docker('pull', image['remote'])
+    for image in images.values():
+        print('Tagging and pushing {} to {} ...'.format(image['remote'], image['local']))
+        run_docker('tag', image['remote'], image['local'])
+        run_docker('push', image['local'])
+
+
+def _pre_build(command_arguments):
+    if '--help' in command_arguments:
+        return []
+
+    # Collect build contexts for which we need to pull the parent image
+    service_arguments = [item for item in command_arguments if item[0] != '-']
+    build_contexts = get_docker_compose_service_items(['build'])
+    if service_arguments:
+        build_contexts = [item for item in build_contexts if item in service_arguments]
+
+    # Prepare parent image references
+    images = set()
+    print('Collecting base images from {} ...'.format(', '.join(build_contexts)))
+    for build_context in build_contexts:
+        dfp = DockerfileParser(build_context)
+        images.update(dfp.parent_images)
+    print('Found {} base images for {} Dockerfiles.'.format(len(images), len(build_contexts)))
+    images = expand_image_references(images)
+
+
+    # determine which images to pull
+    if '--pull' not in command_arguments:
+        def _check_image(image):
+            return run_docker('inspect', image['local'], quiet=True, raise_exception=False)
+
+        images = {k: v for (k, v) in images.items() if not _check_image(v)}
+
+    # Pull images
+    if images:
+        safely_populate_local_from_remote(images)
+    else:
+        print('All base images already present.')
+
+    # Add these arguments to the `docker-compose build` command
+    return ['--build-arg', 'DOCKER_REGISTRY={}'.format(os.environ['DOCKER_REGISTRY'])]
+
+
+def _push(command_arguments):
+    if '--help' in command_arguments:
+        print('Push images to the registry. (No options suppoerted.)')
+        return
+
+    images = get_docker_compose_service_items(['image'])
+    images = expand_image_references(images)
+    with DockerContentTrust():
+        for image in images.values():
+            print('Tagging and pushing {} to {} ...'.format(image['local'], image['remote']))
+            run_docker('tag', image['local'], image['remote'])
+            run_docker('push', image['remote'])
+
+
+def _pull(command_arguments):
+    if '--help' in command_arguments:
+        print('Pull images from the registry. (No options suppoerted.)')
+        return
+
+    images = get_docker_compose_service_items(['image'])
+    images = expand_image_references(images)
+    with DockerContentTrust():
+        for image in images.values():
+            print('Pulling, verifying and tagging {} to {} ...'.format(image['remote'], image['local']))
+            run_docker('pull', image['remote'])
+            run_docker('tag', image['remote'], image['local'])
+
+
+def run(que):
+    hooks = {
+        'build': {'pre': _pre_build},
+        'push': _push,
+        'pull': _pull,
+    }
+
+    try:
+        with Trust(arguments, hooks) as cm:
+            if callable(cm.hook):
+                cm.hook(cm.trusted_arguments)
+            else:
+                cmd = ['docker-compose'] + cm.trusted_arguments
+                print('>>> {}'.format(' '.join(cmd)))
+                process = subprocess.Popen(cmd)
+                process.wait()
+    except RuntimeError as e:
+        if len(e.args) != 1:
+            raise e
+
+        # If an int is given, use it as the return code, otherwise print it and return 1
+        arg = e.args[0]
+        if isinstance(arg, int):
+            que.put(arg)
+        else:
+            que.put(1)
+            print(e)
+
+# Run in a thread to shield run() from Ctrl+C interruptions (instead, will pass on via stdin)
+que = queue.Queue()
+t = Thread(target=run, args=(que,))
+t.start()
+t.join()
+sys.exit(0 if que.empty() else que.get_nowait())
+

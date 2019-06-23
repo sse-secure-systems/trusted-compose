@@ -1,0 +1,2 @@
+dockerfile-parse~=0.0.14
+pyyaml~=5.1.1
