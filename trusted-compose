@@ -111,7 +111,13 @@ class Trust(DockerRegistry):
 def get_docker_compose_service_items(keyList):
     with open('docker-compose.yml', 'r') as stream:
         yml = yaml.safe_load(stream)
-    return [reduce(operator.getitem, keyList, value) for value in yml['services'].values()]
+    ret = []
+    for value in yml['services'].values():
+        try:
+            ret.append(reduce(operator.getitem, keyList, value))
+        except KeyError:
+            pass
+    return ret
 
 
 def run_docker(*args, quiet=False, raise_exception=True):
